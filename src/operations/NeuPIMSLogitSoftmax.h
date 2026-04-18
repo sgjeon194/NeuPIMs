@@ -32,6 +32,11 @@ class NeuPIMSLogitSoftmax : public Operation {
     Tile initialize_instructions(int start, int end);
     uint32_t sram_size_needed();
 
+    // legacy (original multi-head-per-chunk design)
+    void calculate_loops_legacy();
+    void initialize_tiles_legacy();
+    Tile initialize_instructions_legacy(int start, int end);
+
     //    private:
     //     addr_type _spad_addr;
     //     addr_type _acc_spad_addr;

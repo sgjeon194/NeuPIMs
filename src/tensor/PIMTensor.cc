@@ -19,10 +19,20 @@ PIMTensor::PIMTensor(std::string name, uint32_t ch, std::vector<uint32_t> dims,
 
     uint32_t num_alloc_iter = 0;  // calculate # of allocation iterations based on seq_len.
     if (kv_type == PIMTensorKVType::KEY) {
-        // KEY: allocate (E / C) rows
-        _num_rows_per_alloc = ceil((double)_E / (double)_num_ele_per_row);
-        num_alloc_iter = ceil((double)_seq_len / (double)_bank_per_ch);
-    } else {
+        // KEY: per-head layout. One row = 1 head × tokens_per_row tokens.
+        // tokens_per_row = num_ele_per_row / dk = 512/128 = 4 (per bank: 4 tokens × 4 dk-elems = 16 elems)
+        // tiles_per_head = seq_len / (bank_per_ch × tokens_per_row) = 2048/128 = 16
+        // Row index: _rows[h * tiles_per_head + ti]  (head-first, consecutive per head)
+        // Total rows = tiles_per_head × nh = 16 × 32 = 512 (same as original layout)
+        uint32_t nh_local = Config::global_config.model_n_head / Config::global_config.n_tp;
+        uint32_t dk_local = _E / nh_local;
+        uint32_t tokens_per_row = _num_ele_per_row / dk_local;
+        uint32_t tiles_per_head =
+            (uint32_t)ceil((double)_seq_len / ((double)_bank_per_ch * tokens_per_row));
+        _num_rows_per_alloc = tiles_per_head;  // 16 rows per head
+        num_alloc_iter = nh_local;             // 32 heads
+    } 
+    else {
         // VALUE: allocate (E / bank_per_ch) rows
         _num_rows_per_alloc = ceil((double)_E / (double)_bank_per_ch);
         num_alloc_iter = ceil((double)_seq_len / (double)_num_ele_per_row);

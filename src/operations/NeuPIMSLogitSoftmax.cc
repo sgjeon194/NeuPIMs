@@ -77,6 +77,229 @@ void NeuPIMSLogitSoftmax::initialize_tiles() {
 Tile NeuPIMSLogitSoftmax::initialize_instructions(int start, int end) {
     uint32_t banks_per_channel = _config.dram_banks_per_ch;
 
+    // PIMTensor KEY layout (per-head): _rows[h * tiles_per_chunk + ti]
+    // One row = 1 head × tokens_per_row tokens; consecutive rows per head.
+    // NewtonSim is latency-only so physical addresses are not significant.
+
+    auto tile = Tile{
+        .status = Tile::Status::INITIALIZED,
+        .optype = get_name(),
+        .operation_id = _id,
+        .batch = 0,
+        .K = 0,
+        .accum = false,
+    };
+
+    int counter_for_debug = 0;
+
+    for (int i = start; i < end + 1; i++) {
+        auto query = _qs[i];
+        auto key = _ks[i];
+
+        if (query->get_dims()[1] != 1) {  // initiation phase: fall back to NPU path
+            uint32_t seq_len = query->get_dims()[1];
+            assert(seq_len == key->get_dims()[2]);
+
+            for (int h_idx = 0; h_idx < _nh; h_idx++) {
+                std::vector<addr_type> dram_query_addrs;
+                std::vector<addr_type> dram_key_addrs;
+
+                for (int dk_idx = 0; dk_idx < _dk; dk_idx++) {
+                    for (int seq_idx = 0; seq_idx < seq_len; seq_idx++) {
+                        dram_query_addrs.push_back(
+                            query->get_addr(std::vector<uint32_t>{(uint32_t)h_idx, (uint32_t)seq_idx, (uint32_t)dk_idx}));
+                        dram_key_addrs.push_back(
+                            key->get_addr(std::vector<uint32_t>{(uint32_t)h_idx, (uint32_t)dk_idx, (uint32_t)seq_idx}));
+                    }
+                }
+                auto sram_q_entry = allocate_sram_addr(seq_len * _dk, false);
+                auto sram_k_entry = allocate_sram_addr(seq_len * _dk, false);
+                auto sram_l_entry = allocate_sram_addr(seq_len * seq_len, true);
+                auto sram_ls_entry = allocate_sram_addr(seq_len * seq_len, true);
+
+                tile.instructions.push_back(Instruction{
+                    .opcode = Opcode::MOVIN,
+                    .dest_addr = sram_q_entry.first,
+                    .size = sram_q_entry.second,
+                    .src_addrs = dram_query_addrs,
+                    .operand_id = _INPUT_OPERAND,
+                });
+                tile.instructions.push_back(Instruction{
+                    .opcode = Opcode::MOVIN,
+                    .dest_addr = sram_k_entry.first,
+                    .size = sram_k_entry.second,
+                    .src_addrs = dram_key_addrs,
+                    .operand_id = _INPUT_OPERAND + 1,
+                });
+                tile.instructions.push_back(Instruction{
+                    .opcode = Opcode::GEMM,
+                    .dest_addr = sram_l_entry.first,
+                    .size = sram_l_entry.second,
+                    .src_addrs = std::vector<addr_type>{sram_q_entry.first, sram_k_entry.first},
+                    .tile_m = seq_len,
+                    .tile_k = _dk,
+                    .tile_n = seq_len,
+                });
+                tile.instructions.push_back(Instruction{
+                    .opcode = Opcode::SOFTMAX,
+                    .dest_addr = sram_ls_entry.first,
+                    .size = sram_ls_entry.second,
+                    .src_addrs = std::vector<addr_type>{sram_l_entry.first},
+                    .src_from_accum = true,
+                });
+                tile.instructions.push_back(Instruction{
+                    .opcode = Opcode::MOVOUT,
+                    .dest_addr = sram_ls_entry.first,
+                    .size = sram_ls_entry.second,
+                    .src_addrs = std::static_pointer_cast<NPUTensor>(_outputs[i])
+                                     ->_inners[h_idx]
+                                     ->get_all_addrs(),
+                    .operand_id = _OUTPUT_OPERAND,
+                });
+            }
+            continue;
+        }
+
+        // incremental phase: PIM path, one GWRITE per head
+        uint32_t ch = key->get_channel();
+        std::map<uint32_t, std::vector<addr_type>> sram_readres_addrs;
+
+        // tiles_per_chunk: rows per head = seq_len / (bank_per_ch × tokens_per_row) = 16
+        // readres_per_tile: token groups per bank per row = num_ele_per_row / dk = 4
+        //   → per tile: readres_per_tile READRES, each reading 32 banks = 128 outputs/tile
+        //   → 16 tiles × 128 = 2048 outputs per head ✓
+        uint32_t dk_local = _E / _nh;
+        uint32_t tokens_per_row = (_config.dram_page_size / _config.precision) / dk_local;
+        uint32_t readres_per_tile = tokens_per_row;  // = 4
+        uint32_t tiles_per_chunk =
+            key->get_allocated_seq_len() / (banks_per_channel * tokens_per_row);
+
+        for (int h = 0; h < (int)_nh; h++) {
+            addr_type q_addr = query->get_addr(std::vector<uint32_t>{(uint32_t)h, 0, 0});
+            std::pair<addr_type, uint32_t> sram_entry_for_gw = allocate_sram_addr(0, false);
+            tile.instructions.push_back(Instruction{
+                .opcode = Opcode::PIM_GWRITE,
+                .dest_addr = sram_entry_for_gw.first,
+                .size = 0,
+                .src_addrs = std::vector<addr_type>{q_addr},
+                .operand_id = _INPUT_OPERAND,
+            });
+
+            for (int ti = 0; ti < (int)tiles_per_chunk; ti++) {
+                uint32_t row_base = key->_rows[h * (int)tiles_per_chunk + ti];
+                uint32_t p_header_addr = AddressConfig::encode_pim_header(
+                    ch, row_base, false, _comps_per_head * readres_per_tile, readres_per_tile);
+                std::pair<addr_type, uint32_t> sram_phdr_entry = allocate_sram_addr(0, false);
+                tile.instructions.push_back(Instruction{
+                    .opcode = Opcode::PIM_HEADER,
+                    .dest_addr = sram_phdr_entry.first,
+                    .size = 0,
+                    .src_addrs = std::vector<addr_type>{p_header_addr},
+                    .operand_id = _INPUT_OPERAND,
+                });
+
+                // readres_per_tile token groups, each: comps_per_head COMPs + 1 READRES
+                for (int tg = 0; tg < (int)readres_per_tile; tg++) {
+                    auto sram_res_entry = allocate_sram_addr(banks_per_channel, false);
+                    addr_type sram_res_addr = sram_res_entry.first;
+                    uint64_t dram_addr = AddressConfig::encode_pim_comps_readres(
+                        ch, row_base, _comps_per_head, tg == (int)readres_per_tile - 1);
+
+                    if (_config.dram_type == DramType::NEWTON) {
+                        Instruction comp_inst{
+                            .opcode = Opcode::PIM_COMP,
+                            .dest_addr = sram_res_addr,
+                            .size = 0,
+                            .src_addrs = std::vector<addr_type>{dram_addr},
+                            .operand_id = _INPUT_OPERAND,
+                        };
+                        for (int j = 0; j < (int)_comps_per_head; j++)
+                            tile.instructions.push_back(comp_inst);
+                        tile.instructions.push_back(Instruction{
+                            .opcode = Opcode::PIM_READRES,
+                            .dest_addr = sram_res_addr,
+                            .size = sram_res_entry.second,
+                            .src_addrs = std::vector<addr_type>{dram_addr},
+                            .operand_id = _INPUT_OPERAND,
+                        });
+                    } else {
+                        tile.instructions.push_back(Instruction{
+                            .opcode = Opcode::PIM_COMPS_READRES,
+                            .dest_addr = sram_res_addr,
+                            .size = sram_res_entry.second,
+                            .src_addrs = std::vector<addr_type>{dram_addr},
+                            .operand_id = _INPUT_OPERAND,
+                        });
+                    }
+
+                    if (sram_readres_addrs.find(h) == sram_readres_addrs.end())
+                        sram_readres_addrs[h] = std::vector<addr_type>{sram_res_addr};
+                    else
+                        sram_readres_addrs[h].push_back(sram_res_addr);
+                }
+            }
+        }
+
+        for (int hi = 0; hi < (int)_nh; hi++) {
+            assert(sram_readres_addrs[hi].size() == tiles_per_chunk * readres_per_tile);
+            uint32_t column_height = key->_seq_len;
+            std::pair<addr_type, uint32_t> sram_acc_entry = allocate_sram_addr(column_height, true);
+
+            tile.instructions.push_back(Instruction{
+                .opcode = Opcode::SOFTMAX,
+                .dest_addr = sram_acc_entry.first,
+                .size = sram_acc_entry.second,
+                .src_addrs = sram_readres_addrs[hi],
+            });
+            tile.instructions.push_back(Instruction{
+                .opcode = Opcode::MOVOUT,
+                .dest_addr = sram_acc_entry.first,
+                .size = sram_acc_entry.second,
+                .src_addrs = std::static_pointer_cast<NPUTensor>(_outputs[i])
+                                 ->_inners[hi]
+                                 ->get_all_addrs(),
+                .operand_id = _OUTPUT_OPERAND,
+            });
+            counter_for_debug++;
+        }
+    }
+
+    return tile;
+}
+
+void NeuPIMSLogitSoftmax::calculate_loops() {
+    assert(sram_size_needed() < _config.spad_size KB / 2);
+
+    uint32_t datas_per_comp_cmd = _config.pim_comp_coverage;
+
+    // one chunk = one head; one GWRITE per head with Q[h, 0, :]
+    _chunks = _nh;
+    _heads_per_tile = 1;
+    _heads_in_last_chunk = 1;
+    _comps_per_head = (uint32_t)ceil((double)_dk / datas_per_comp_cmd);
+
+    spdlog::info("chunks (=nh): {}", _chunks);
+    spdlog::info("heads per tile: {}", _heads_per_tile);
+    spdlog::info("comps per head: {}", _comps_per_head);
+}
+
+
+void NeuPIMSLogitSoftmax::initialize_tiles_legacy() {
+    int num_npu_tiles = _req_idxs.size();
+    int prev_idx = 0;
+    for (int i = 0; i < num_npu_tiles; i++) {
+        int req_idx = _req_idxs[i];
+        if (i == num_npu_tiles - 1) {
+            assert(req_idx == _batch_size - 1);
+        }
+        _tiles.push_back(initialize_instructions_legacy(prev_idx, req_idx));
+        prev_idx = req_idx;
+    }
+}
+
+Tile NeuPIMSLogitSoftmax::initialize_instructions_legacy(int start, int end) {
+    uint32_t banks_per_channel = _config.dram_banks_per_ch;
+
     auto tile = Tile{
         .status = Tile::Status::INITIALIZED,
         .optype = get_name(),
@@ -300,7 +523,7 @@ Tile NeuPIMSLogitSoftmax::initialize_instructions(int start, int end) {
     return tile;
 }
 
-void NeuPIMSLogitSoftmax::calculate_loops() {
+void NeuPIMSLogitSoftmax::calculate_loops_legacy() {
     assert(sram_size_needed() < _config.spad_size KB / 2);
 
     uint32_t E = _config.model_n_embd / _config.n_tp;
@@ -315,10 +538,10 @@ void NeuPIMSLogitSoftmax::calculate_loops() {
         E % page_size == 0 ? _heads_per_tile : ceil((double)(E % page_size) / _dk);
     _comps_per_head = ceil((double)_dk / datas_per_comp_cmd);
 
-    spdlog::info("chunks: {}", _chunks);
-    spdlog::info("heads per tile: {}", _heads_per_tile);
-    spdlog::info("heads in last chunk: {}", _heads_in_last_chunk);
-    spdlog::info("comps per head: {}", _comps_per_head);
+    spdlog::info("[legacy] chunks: {}", _chunks);
+    spdlog::info("[legacy] heads per tile: {}", _heads_per_tile);
+    spdlog::info("[legacy] heads in last chunk: {}", _heads_in_last_chunk);
+    spdlog::info("[legacy] comps per head: {}", _comps_per_head);
 }
 
 uint32_t NeuPIMSLogitSoftmax::sram_size_needed() {
