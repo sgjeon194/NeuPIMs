@@ -34,5 +34,8 @@ class NeuPIMSAttend : public Operation {
     void calculate_loops();
     void initialize_tiles();
     Tile initialize_instructions(int start, int end);
+
+    Tile initialize_instructions_legacy(int start, int end);
+
     uint32_t sram_size_needed();
 };

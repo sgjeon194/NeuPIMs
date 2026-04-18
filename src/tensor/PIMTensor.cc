@@ -33,9 +33,15 @@ PIMTensor::PIMTensor(std::string name, uint32_t ch, std::vector<uint32_t> dims,
         num_alloc_iter = nh_local;             // 32 heads
     } 
     else {
-        // VALUE: allocate (E / bank_per_ch) rows
-        _num_rows_per_alloc = ceil((double)_E / (double)_bank_per_ch);
-        num_alloc_iter = ceil((double)_seq_len / (double)_num_ele_per_row);
+        // VALUE: per-head layout. rows_per_head = dk_tiles × seq_chunks.
+        // Row index: _rows[h * rows_per_head + ti * seq_chunks + ci]
+        // Total = rows_per_head × nh = 16 × 32 = 512 (same as original)
+        uint32_t nh_local = Config::global_config.model_n_head / Config::global_config.n_tp;
+        uint32_t dk_local = _E / nh_local;
+        uint32_t dk_tiles = (uint32_t)ceil((double)dk_local / _bank_per_ch);
+        uint32_t seq_chunks = (uint32_t)ceil((double)_seq_len / _num_ele_per_row);
+        _num_rows_per_alloc = dk_tiles * seq_chunks;  // = 16 rows per head
+        num_alloc_iter = nh_local;                    // = 32 heads
     }
 
     uint32_t num_required_alloc = num_alloc_iter * _num_rows_per_alloc;
